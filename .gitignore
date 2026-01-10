@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+sfm_plots/
+.DS_Store

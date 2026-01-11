@@ -2,3 +2,7 @@ __pycache__/
 .venv/
 sfm_plots/
 .DS_Store
+RoMa_demo/
+assets/
+output/
+sfm_plots_copy/

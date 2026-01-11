@@ -6,6 +6,23 @@ import os
 from project_helpers import get_dataset_info
 from project_helpers import homography_to_RT
 
+
+def _imread_color_no_exif_rotation(path: str):
+    flags = cv2.IMREAD_COLOR
+    # OpenCV may auto-rotate based on EXIF orientation; disable for consistency.
+    if hasattr(cv2, "IMREAD_IGNORE_ORIENTATION"):
+        flags |= cv2.IMREAD_IGNORE_ORIENTATION
+    return cv2.imread(path, flags)
+
+# Optional dense reconstruction (RoMa)
+try:
+    from roma_dense import run_dense_reconstruction_roma, save_ply
+    ROMA_DENSE_AVAILABLE = True
+except Exception:
+    run_dense_reconstruction_roma = None
+    save_ply = None
+    ROMA_DENSE_AVAILABLE = False
+
 # ==========================================
 # 辅助函数 / 核心算法实现
 # ==========================================
@@ -135,15 +152,19 @@ def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000):
             # 从 H 分解出可能的 (R, t) 列表 [cite: 145]
             # homography_to_RT 返回 [(R1, t1), (R2, t2), ...]
             try:
-                poses_from_H = homography_to_RT(H_cand) 
-                
-                for R_H, t_H in poses_from_H:
-                    # 检查 H 分解出的每个解
-                    count, inliers, valid = check_pose_inliers(R_H, t_H, x1s, x2s, threshold_sq)
-                    if valid and count > best_score:
-                        best_score = count
-                        best_Rt = (R_H, t_H)
-                        best_inliers = inliers
+                RTs = homography_to_RT(H_cand)
+                RTs = np.asarray(RTs)
+                # project_helpers.homography_to_RT returns shape (2, 3, 4): [R|t] for 2 hypotheses.
+                if RTs.ndim == 3 and RTs.shape[1:] == (3, 4):
+                    for k in range(RTs.shape[0]):
+                        R_H = RTs[k, :, :3]
+                        t_H = RTs[k, :, 3]
+                        # 检查 H 分解出的每个解
+                        count, inliers, valid = check_pose_inliers(R_H, t_H, x1s, x2s, threshold_sq)
+                        if valid and count > best_score:
+                            best_score = count
+                            best_Rt = (R_H, t_H)
+                            best_inliers = inliers
             except Exception:
                 pass # 忽略分解失败的情况，继续循环
 
@@ -651,7 +672,16 @@ def plot_3d_reconstruction_maybe(points_3d, cameras, *, show=True, save_path=Non
 # MAIN SFM LOOP
 # ==========================================
 
-def run_sfm(dataset_num, *, visualize=True, save_plot_dir=None, return_metrics=True):
+def run_sfm(
+    dataset_num,
+    *,
+    visualize=True,
+    save_plot_dir=None,
+    return_metrics=True,
+    use_roma_dense=False,
+    roma_confidence_thresh=0.7,
+    roma_downsample_max_size=1024,
+):
     print(f"--- Running SfM on Dataset {dataset_num} ---")
     K, img_names, init_pair, pixel_threshold = get_dataset_info(dataset_num)
     if K is None: return
@@ -666,7 +696,7 @@ def run_sfm(dataset_num, *, visualize=True, save_plot_dir=None, return_metrics=T
     # 1. Load Images
     images = []
     for name in img_names:
-        img = cv2.imread(name)
+        img = _imread_color_no_exif_rotation(name)
         if img is None: print(f"Error reading {name}"); return
         images.append(img)
     print(f"Loaded {len(images)} images.")
@@ -803,15 +833,18 @@ def run_sfm(dataset_num, *, visualize=True, save_plot_dir=None, return_metrics=T
         # Normalize
         p_ref_n = normalize_points(p_ref_seq, K)
         p_i_n = normalize_points(p_i_seq, K)
-        
-        E_seq, mask_seq = ransac_estimate_E(p_ref_n, p_i_n, threshold=norm_threshold)
-        if E_seq is None: continue
-        
-        # Extract Relative Rotation
-        cands_seq = extract_P_from_E(E_seq)
-        # Select best R_rel based on inliers
-        R_rel_seq, t_rel_dummy = select_correct_pose(cands_seq, np.eye(4)[:3], 
-                                                     p_ref_n[:, mask_seq], p_i_n[:, mask_seq])
+
+        # Robust pairwise pose for potentially planar scenes:
+        # Use parallel RANSAC (E vs H) to avoid degeneracy of E-only estimation.
+        R_rel_seq, t_rel_seq, mask_seq = ransac_estimate_parallel(
+            p_ref_n,
+            p_i_n,
+            threshold=norm_threshold,
+            num_iterations=2000,
+        )
+        if R_rel_seq is None or mask_seq is None or np.sum(mask_seq) < 8:
+            print(f"Pose estimation failed (E/H parallel RANSAC) {ref_idx}-{i}")
+            continue
                                                      
         # 3.2 Upgrade to Absolute Rotation [cite: 38, 69]
         # R_i = R_rel * R_ref (注意：这里的 R_rel 是 ref -> i 的旋转)
@@ -855,7 +888,7 @@ def run_sfm(dataset_num, *, visualize=True, save_plot_dir=None, return_metrics=T
             P_ref = np.hstack([R_ref_w, np.asarray(t_ref_w, dtype=np.float64).reshape(3, 1)])
             P_i = np.hstack([R_i_abs, np.asarray(t_i_abs, dtype=np.float64).reshape(3, 1)])
 
-            # Use inliers from E-seq estimation for triangulation candidates.
+            # Use inliers from the pairwise pose estimation for triangulation candidates.
             in_mask = np.asarray(mask_seq, dtype=bool)
             if np.sum(in_mask) >= 8:
                 # Indices in keypoint arrays
@@ -920,19 +953,53 @@ def run_sfm(dataset_num, *, visualize=True, save_plot_dir=None, return_metrics=T
         
     metrics["summary"]["localized_images"] = len(cameras_pose)
     metrics["summary"]["cloud_points"] = final_points.shape[1]
+
+    # --------------------------------------------------------
+    # STEP 4 (Bonus): Dense reconstruction with RoMa (optional)
+    # --------------------------------------------------------
+    dense_cloud = None
+    dense_colors = None
+    if use_roma_dense:
+        if not ROMA_DENSE_AVAILABLE:
+            print("RoMa dense module not available; skipping. (Install torch + romatch, or check import)")
+        else:
+            dense_res = run_dense_reconstruction_roma(
+                int(dataset_num),
+                cameras_pose,
+                K,
+                img_names,
+                confidence_thresh=float(roma_confidence_thresh),
+                downsample_max_size=int(roma_downsample_max_size),
+            )
+            if dense_res is not None:
+                dense_cloud = dense_res.points_3d
+                dense_colors = dense_res.colors_rgb
+                metrics["summary"]["dense_points"] = int(dense_cloud.shape[1])
+                metrics["summary"]["dense_pairs_processed"] = int(dense_res.pairs_processed)
+                metrics["summary"]["dense_pairs_skipped"] = int(dense_res.pairs_skipped)
+
+                if save_plot_dir:
+                    ply_path = os.path.join(save_plot_dir, f"dense_{dataset_num}.ply")
+                    save_ply(ply_path, dense_cloud, dense_colors)
+                    print(f"Saved dense point cloud to {ply_path}")
+            else:
+                print("RoMa dense ran but returned no points (missing deps or too few confident matches).")
     
+    points_to_plot = dense_cloud if dense_cloud is not None else final_points
+
     if visualize or save_plot_dir:
         save_path = os.path.join(save_plot_dir, f"res_{dataset_num}.png") if save_plot_dir else None
-        plot_3d_reconstruction_maybe(final_points, cam_centers, show=visualize, save_path=save_path)
+        plot_3d_reconstruction_maybe(points_to_plot, cam_centers, show=visualize, save_path=save_path)
         
     return metrics
 
-def run_all_datasets(start=1, end=9, *, visualize=False, save_plot_dir=None):
+def run_all_datasets(start=1, end=9, *, visualize=False, use_roma_dense=True, save_plot_dir=None):
     for d in range(start, end + 1):
         try:
-            run_sfm(d, visualize=visualize, save_plot_dir=save_plot_dir)
+            run_sfm(d, visualize=visualize, use_roma_dense=use_roma_dense, save_plot_dir=save_plot_dir)
         except Exception as e:
             print(f"Dataset {d} error: {e}")
 
 if __name__ == "__main__":
-    run_all_datasets(1, 7, visualize=False, save_plot_dir="./sfm_plots")
+    # run_all_datasets(1, 7, visualize=False, use_roma_dense=True, save_plot_dir="./sfm_plots_copy")
+    run_sfm(5, visualize=True, use_roma_dense=False, save_plot_dir="./output")

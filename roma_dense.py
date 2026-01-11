@@ -97,6 +97,8 @@ def run_dense_reconstruction_roma(
     confidence_thresh: float = 0.7,
     downsample_max_size: int = 1024,
     max_points_per_pair: int = 25000,
+    seed: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> Optional[DenseReconstructionResult]:
     """Create a denser point cloud using RoMa matches + known camera poses.
 
@@ -111,6 +113,9 @@ def run_dense_reconstruction_roma(
 
     if K is None or len(img_names) == 0 or cameras_pose is None:
         return None
+
+    if rng is None:
+        rng = np.random.default_rng(None if seed is None else int(seed))
 
     # Pick pairs among localized images: (i_k, i_{k+1}) in index order.
     localized = sorted(int(i) for i in cameras_pose.keys())
@@ -189,7 +194,7 @@ def run_dense_reconstruction_roma(
             continue
 
         if max_points_per_pair > 0 and idx.size > max_points_per_pair:
-            idx = np.random.choice(idx, int(max_points_per_pair), replace=False)
+            idx = rng.choice(idx, int(max_points_per_pair), replace=False)
 
         ptsA = kptsA[idx, :]
         ptsB = kptsB[idx, :]

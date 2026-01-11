@@ -3,8 +3,41 @@ import cv2
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import os
+import random
 from project_helpers import get_dataset_info
 from project_helpers import homography_to_RT
+from project_helpers import correct_H_sign
+
+
+def set_global_seed(seed: int, *, deterministic_cv2: bool = False) -> None:
+    """Best-effort global seeding for reproducibility.
+
+    Notes:
+    - Our RANSAC loops use a local NumPy Generator when provided (preferred).
+    - This function also seeds Python's `random` and OpenCV's RNG (if available).
+    - `deterministic_cv2=True` forces single-thread OpenCV to reduce nondeterminism.
+    """
+    seed_i = int(seed)
+    np.random.seed(seed_i)
+    random.seed(seed_i)
+    if hasattr(cv2, "setRNGSeed"):
+        try:
+            cv2.setRNGSeed(seed_i)
+        except Exception:
+            pass
+    if deterministic_cv2 and hasattr(cv2, "setNumThreads"):
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+
+
+def _make_rng(seed: int | None = None, rng: np.random.Generator | None = None) -> np.random.Generator:
+    if rng is not None:
+        return rng
+    if seed is None:
+        return np.random.default_rng()
+    return np.random.default_rng(int(seed))
 
 
 def _imread_color_no_exif_rotation(path: str):
@@ -32,33 +65,122 @@ def estimate_H_DLT(x1, x2):
     使用 DLT 算法从至少 4 对点估计单应性矩阵 H [cite: 144]。
     x1, x2: 3xN 归一化坐标
     """
+    x1 = np.asarray(x1, dtype=np.float64)
+    x2 = np.asarray(x2, dtype=np.float64)
+    if x1.ndim != 2 or x2.ndim != 2 or x1.shape[0] != 3 or x2.shape[0] != 3:
+        return None
+
+    valid = np.all(np.isfinite(x1), axis=0) & np.all(np.isfinite(x2), axis=0)
+    x1 = x1[:, valid]
+    x2 = x2[:, valid]
     n = x1.shape[1]
-    if n < 4: return None
-    
-    # 转换为非齐次坐标 (u, v) 以构建矩阵 A
-    # 注意：输入通常已经是归一化平面的点 (z=1)，但为了安全重新除以 z
-    with np.errstate(all='ignore'):
-        u1, v1 = x1[0]/x1[2], x1[1]/x1[2]
-        u2, v2 = x2[0]/x2[2], x2[1]/x2[2]
-    
-    A = []
-    # 使用前 4 个点构建矩阵 (通常 RANSAC 中只传 4 个点)
-    for i in range(n):
-        x, y = u1[i], v1[i]
-        xp, yp = u2[i], v2[i]
-        # DLT 行公式: x' = Hx -> x' x Hx = 0
-        A.append([-x, -y, -1, 0, 0, 0, x*xp, y*xp, xp])
-        A.append([0, 0, 0, -x, -y, -1, x*yp, y*yp, yp])
-        
-    A = np.asarray(A)
-    # SVD 解 Ax = 0
+    if n < 4:
+        return None
+
+    # Hartley normalization improves numerical stability (important for near-planar scenes).
+    T1, x1n = _hartley_normalize_2d(x1)
+    T2, x2n = _hartley_normalize_2d(x2)
+
+    x1i = _to_inhomogeneous_2d(x1n)
+    x2i = _to_inhomogeneous_2d(x2n)
+    u1, v1 = x1i[0, :], x1i[1, :]
+    u2, v2 = x2i[0, :], x2i[1, :]
+
+    A = np.zeros((2 * n, 9), dtype=np.float64)
+    # DLT constraints for x' ~ H x.
+    A[0::2, 0] = -u1
+    A[0::2, 1] = -v1
+    A[0::2, 2] = -1.0
+    A[0::2, 6] = u1 * u2
+    A[0::2, 7] = v1 * u2
+    A[0::2, 8] = u2
+
+    A[1::2, 3] = -u1
+    A[1::2, 4] = -v1
+    A[1::2, 5] = -1.0
+    A[1::2, 6] = u1 * v2
+    A[1::2, 7] = v1 * v2
+    A[1::2, 8] = v2
+
     try:
-        U, S, Vt = np.linalg.svd(A)
+        _, _, Vt = np.linalg.svd(A)
     except np.linalg.LinAlgError:
         return None
-        
-    H = Vt[-1].reshape(3, 3)
+
+    Hn = Vt[-1, :].reshape(3, 3)
+    try:
+        T2inv = np.linalg.inv(T2)
+    except np.linalg.LinAlgError:
+        return None
+
+    H = T2inv @ Hn @ T1
+    if not np.all(np.isfinite(H)):
+        return None
+
+    # Normalize scale for consistency.
+    if np.isfinite(H[2, 2]) and abs(H[2, 2]) > 1e-12:
+        H = H / H[2, 2]
     return H
+
+
+def _symmetric_transfer_errors_sq(H, x1s, x2s):
+    """Symmetric transfer error for homography (squared), in normalized coordinates."""
+    H = np.asarray(H, dtype=np.float64)
+    x1s = np.asarray(x1s, dtype=np.float64)
+    x2s = np.asarray(x2s, dtype=np.float64)
+    if H.shape != (3, 3) or x1s.shape[0] != 3 or x2s.shape[0] != 3:
+        return None
+
+    with np.errstate(all='ignore'):
+        x2p = H @ x1s
+    x2p_i = _to_inhomogeneous_2d(x2p)
+    x2_i = _to_inhomogeneous_2d(x2s)
+    with np.errstate(all='ignore'):
+        d_fwd = np.sum((x2_i - x2p_i) ** 2, axis=0)
+
+    try:
+        Hinv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return None
+
+    with np.errstate(all='ignore'):
+        x1p = Hinv @ x2s
+    x1p_i = _to_inhomogeneous_2d(x1p)
+    x1_i = _to_inhomogeneous_2d(x1s)
+    with np.errstate(all='ignore'):
+        d_bwd = np.sum((x1_i - x1p_i) ** 2, axis=0)
+
+    d2 = d_fwd + d_bwd
+    d2 = np.where(np.isfinite(d2), d2, np.inf)
+    return d2
+
+
+def _cheirality_positive_count(R, t, x1s, x2s, inliers, *, max_points=50, rng: np.random.Generator | None = None):
+    """Count points with positive depth in both views for pose (R,t)."""
+    if inliers is None:
+        return 0, 0
+    idx = np.where(np.asarray(inliers, dtype=bool))[0]
+    if idx.size == 0:
+        return 0, 0
+    if max_points > 0 and idx.size > max_points:
+        rng = _make_rng(rng=rng)
+        idx = rng.choice(idx, int(max_points), replace=False)
+
+    P1 = np.eye(4)[:3]
+    t = np.asarray(t, dtype=np.float64).reshape(3, 1)
+    P2 = np.hstack((np.asarray(R, dtype=np.float64), t))
+
+    pos = 0
+    checked = 0
+    for j in idx:
+        X = triangulate_point_DLT(P1, P2, x1s[:, j], x2s[:, j])
+        if not np.all(np.isfinite(X)):
+            continue
+        X_cam2 = (P2 @ X)
+        checked += 1
+        if X[2] > 0 and X_cam2[2] > 0:
+            pos += 1
+    return int(pos), int(checked)
 
 def check_pose_inliers(R, t, x1, x2, threshold_sq):
     """
@@ -78,24 +200,19 @@ def check_pose_inliers(R, t, x1, x2, threshold_sq):
     count = np.sum(inliers)
     
     # 如果内点太少，跳过昂贵的三角化检查
-    if count < 5: return 0, inliers, False
+    if count < 8:
+        return 0, inliers, False
 
-    # 2. Cheirality 检查 (点必须在两个相机前方) [cite: 128]
-    # 仅三角化第一个内点进行快速检查
-    idx = np.where(inliers)[0][0]
-    P1 = np.eye(4)[:3]
-    P2 = np.hstack((R, t))
-    
-    # 使用现有的单点三角化函数
-    X = triangulate_point_DLT(P1, P2, x1[:, idx], x2[:, idx])
-    
-    # 检查两个相机坐标系下的 Z > 0
-    X_cam2 = R @ X[:3] + t.flatten()
-    is_valid = (X[2] > 0) and (X_cam2[2] > 0)
-    
-    return count, inliers, is_valid
+    # 2. Cheirality 检查：用多个内点更稳健（平面/小基线时单点容易误判）
+    pos, checked = _cheirality_positive_count(R, t, x1, x2, inliers, max_points=25)
+    if checked == 0:
+        return int(count), inliers, False
 
-def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000):
+    frac = float(pos) / float(checked)
+    is_valid = (pos >= 5) and (frac >= 0.6)
+    return int(count), inliers, bool(is_valid)
+
+def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000, *, rng: np.random.Generator | None = None):
     """
     并行 RANSAC：同时搜索 E (8点法) 和 H (4点法) [cite: 138, 152]。
     直接返回最佳的 (R, t) 以及内点掩码。
@@ -113,9 +230,10 @@ def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000):
     # 预先构建 Identity 矩阵用于 select_correct_pose
     P1_identity = np.eye(4)[:3]
 
+    rng = _make_rng(rng=rng)
     for _ in range(num_iterations):
         # 1. 采样 8 个点 (E 需要 8 个，H 只需要其中 4 个)
-        sample_idx = np.random.choice(n_points, 8, replace=False)
+        sample_idx = rng.choice(n_points, 8, replace=False)
         x1_sample, x2_sample = x1s[:, sample_idx], x2s[:, sample_idx]
         
         # ==========================================
@@ -149,6 +267,12 @@ def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000):
         H_cand = estimate_H_DLT(x1_sample[:, :4], x2_sample[:, :4])
         
         if H_cand is not None:
+            # Stabilize sign for decomposition.
+            try:
+                H_cand = correct_H_sign(H_cand, x1_sample[:, :4], x2_sample[:, :4])
+            except Exception:
+                pass
+
             # 从 H 分解出可能的 (R, t) 列表 [cite: 145]
             # homography_to_RT 返回 [(R1, t1), (R2, t2), ...]
             try:
@@ -156,15 +280,31 @@ def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000):
                 RTs = np.asarray(RTs)
                 # project_helpers.homography_to_RT returns shape (2, 3, 4): [R|t] for 2 hypotheses.
                 if RTs.ndim == 3 and RTs.shape[1:] == (3, 4):
+                    # Score H by symmetric transfer error (more appropriate for planar scenes).
+                    d2_h = _symmetric_transfer_errors_sq(H_cand, x1s, x2s)
+                    if d2_h is None:
+                        continue
+                    inliers_h = d2_h < (2.0 * threshold_sq)
+                    count_h = int(np.sum(inliers_h))
+
                     for k in range(RTs.shape[0]):
                         R_H = RTs[k, :, :3]
                         t_H = RTs[k, :, 3]
-                        # 检查 H 分解出的每个解
-                        count, inliers, valid = check_pose_inliers(R_H, t_H, x1s, x2s, threshold_sq)
-                        if valid and count > best_score:
-                            best_score = count
+                        # Cheirality validation using H-inliers.
+                        pos, checked = _cheirality_positive_count(
+                            R_H,
+                            t_H,
+                            x1s,
+                            x2s,
+                            inliers_h,
+                            max_points=50,
+                            rng=rng,
+                        )
+                        valid = (checked > 0) and (pos >= 8) and ((pos / checked) >= 0.6)
+                        if valid and count_h > best_score:
+                            best_score = count_h
                             best_Rt = (R_H, t_H)
-                            best_inliers = inliers
+                            best_inliers = inliers_h
             except Exception:
                 pass # 忽略分解失败的情况，继续循环
 
@@ -367,7 +507,7 @@ def compute_sampson_errors(E, x1s, x2s):
     return d2
 
 
-def ransac_estimate_E(x1s, x2s, threshold=0.001, num_iterations=2000):
+def ransac_estimate_E(x1s, x2s, threshold=0.001, num_iterations=2000, *, rng: np.random.Generator | None = None):
     """
     RANSAC loop for Essential Matrix estimation[cite: 117, 139].
     x1s, x2s: Normalized coordinates (3xN)
@@ -376,10 +516,11 @@ def ransac_estimate_E(x1s, x2s, threshold=0.001, num_iterations=2000):
     max_inliers_count = 0
     n_points = x1s.shape[1]
     
+    rng = _make_rng(rng=rng)
     # 简单的随机采样
     for _ in range(num_iterations):
         if n_points < 8: break
-        sample_idx = np.random.choice(n_points, 8, replace=False)
+        sample_idx = rng.choice(n_points, 8, replace=False)
         x1_sample, x2_sample = x1s[:, sample_idx], x2s[:, sample_idx]
         
         E_approx = estimate_F_DLT(x1_sample, x2_sample)
@@ -505,7 +646,7 @@ def estimate_T_linear(points2D, points3D, R):
     return np.asarray(T, dtype=np.float64)
 
 
-def estimate_T_robust(points2D, points3D, R, threshold=0.005, num_iterations=1000):
+def estimate_T_robust(points2D, points3D, R, threshold=0.005, num_iterations=1000, *, rng: np.random.Generator | None = None):
     """
     Robustly estimate T using RANSAC[cite: 106, 129].
     points2D should be NORMALIZED coordinates.
@@ -530,9 +671,10 @@ def estimate_T_robust(points2D, points3D, R, threshold=0.005, num_iterations=100
     
     if N < 2: return None, None 
     
+    rng = _make_rng(rng=rng)
     for i in range(num_iterations):
         # 1. Minimal sample (2 points) [cite: 106]
-        idx = np.random.choice(N, 2, replace=False)
+        idx = rng.choice(N, 2, replace=False)
         sample_2d = points2D[:, idx]
         sample_3d = points3D[:, idx]
         
@@ -681,10 +823,16 @@ def run_sfm(
     use_roma_dense=False,
     roma_confidence_thresh=0.7,
     roma_downsample_max_size=1024,
+    seed: int | None = None,
 ):
     print(f"--- Running SfM on Dataset {dataset_num} ---")
     K, img_names, init_pair, pixel_threshold = get_dataset_info(dataset_num)
     if K is None: return
+
+    if seed is not None:
+        # Seed once per run for reproducibility.
+        set_global_seed(int(seed), deterministic_cv2=True)
+    rng = _make_rng(seed=seed)
 
     metrics = {
         "dataset": int(dataset_num),
@@ -726,7 +874,7 @@ def run_sfm(
     # 2.2 使用并行 RANSAC (同时搜索 E 和 H) [cite: 138]
     print(f"Running Parallel RANSAC on {pts1_good_n.shape[1]} matches...")
     R_rel, t_rel, inlier_mask_init = ransac_estimate_parallel(
-        pts1_good_n, pts2_good_n, threshold=norm_threshold
+        pts1_good_n, pts2_good_n, threshold=norm_threshold, rng=rng
     )
     
     if R_rel is None:
@@ -841,6 +989,7 @@ def run_sfm(
             p_i_n,
             threshold=norm_threshold,
             num_iterations=2000,
+            rng=rng,
         )
         if R_rel_seq is None or mask_seq is None or np.sum(mask_seq) < 8:
             print(f"Pose estimation failed (E/H parallel RANSAC) {ref_idx}-{i}")
@@ -875,7 +1024,8 @@ def run_sfm(
         
         # Run custom T estimation [cite: 129]
         t_i_abs, t_inliers = estimate_T_robust(pts2d_norm, pts3d_np, R_i_abs, 
-                                               threshold=norm_threshold*2.0) # slightly looser for PnP
+                                               threshold=norm_threshold*2.0,
+                                               rng=rng) # slightly looser for PnP
         
         if t_i_abs is not None:
             num_inliers = np.sum(t_inliers)
@@ -970,6 +1120,7 @@ def run_sfm(
                 img_names,
                 confidence_thresh=float(roma_confidence_thresh),
                 downsample_max_size=int(roma_downsample_max_size),
+                rng=rng,
             )
             if dense_res is not None:
                 dense_cloud = dense_res.points_3d
@@ -993,13 +1144,19 @@ def run_sfm(
         
     return metrics
 
-def run_all_datasets(start=1, end=9, *, visualize=False, use_roma_dense=True, save_plot_dir=None):
+def run_all_datasets(start=1, end=9, *, visualize=False, use_roma_dense=True, save_plot_dir=None, seed: int | None = None):
     for d in range(start, end + 1):
         try:
-            run_sfm(d, visualize=visualize, use_roma_dense=use_roma_dense, save_plot_dir=save_plot_dir)
+            run_sfm(
+                d,
+                visualize=visualize,
+                use_roma_dense=use_roma_dense,
+                save_plot_dir=save_plot_dir,
+                seed=seed,
+            )
         except Exception as e:
             print(f"Dataset {d} error: {e}")
 
 if __name__ == "__main__":
     # run_all_datasets(1, 7, visualize=False, use_roma_dense=True, save_plot_dir="./sfm_plots_copy")
-    run_sfm(5, visualize=True, use_roma_dense=False, save_plot_dir="./output")
+    run_sfm(7, visualize=True, use_roma_dense=True, save_plot_dir="./output")

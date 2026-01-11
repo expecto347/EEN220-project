@@ -757,6 +757,57 @@ def _append_to_cloud(cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_p
     cloud_px_2 = np.vstack([cloud_px_2, px2_new])
     return cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
 
+
+def filter_points_distance_quantile(
+    cloud_points,
+    cloud_des_1,
+    cloud_des_2,
+    cloud_px_1,
+    cloud_px_2,
+    factor=5.0,
+    quantile=90,
+):
+    """Filters 3D points based on distance from the center of gravity.
+
+    Rule: || X - mean(X) || <= factor * (quantile of distances)
+    """
+    if cloud_points is None:
+        return cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
+
+    cloud_points = np.asarray(cloud_points, dtype=np.float64)
+    if cloud_points.ndim != 2 or cloud_points.shape[0] != 3 or cloud_points.shape[1] == 0:
+        return cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
+
+    # 1. Calculate Center of Gravity (Centroid)
+    center = np.mean(cloud_points, axis=1, keepdims=True)
+
+    # 2. Calculate Euclidean distances from center
+    diff = cloud_points - center
+    distances = np.linalg.norm(diff, axis=0)
+    distances = distances[np.isfinite(distances)]
+    if distances.size == 0:
+        return cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
+
+    # 3. Calculate the quantile of distances
+    q_val = np.percentile(distances, float(quantile))
+
+    # 4. Create Mask
+    limit = float(factor) * float(q_val)
+    mask = np.linalg.norm(diff, axis=0) <= limit
+
+    n_removed = int(cloud_points.shape[1] - np.sum(mask))
+    if n_removed > 0:
+        print(f"  [Filter] Removed {n_removed} points > {limit:.2f} units from center.")
+
+    # 5. Apply Mask to all associated arrays
+    new_points = cloud_points[:, mask]
+    new_des_1 = cloud_des_1[mask] if cloud_des_1 is not None else None
+    new_des_2 = cloud_des_2[mask] if cloud_des_2 is not None else None
+    new_px_1 = cloud_px_1[mask] if cloud_px_1 is not None else None
+    new_px_2 = cloud_px_2[mask] if cloud_px_2 is not None else None
+
+    return new_points, new_des_1, new_des_2, new_px_1, new_px_2
+
 def _merge_unique_correspondences(corr_lists):
     all_corr = []
     for corr in corr_lists:
@@ -823,6 +874,7 @@ def run_sfm(
     use_roma_dense=False,
     roma_confidence_thresh=0.7,
     roma_downsample_max_size=1024,
+    filter_final_cloud: bool = True,
     seed: int | None = None,
 ):
     print(f"--- Running SfM on Dataset {dataset_num} ---")
@@ -924,6 +976,11 @@ def run_sfm(
     cloud_des_2 = np.array(cloud_des_2)
     cloud_px_1 = np.array(cloud_px_1, dtype=np.float64)
     cloud_px_2 = np.array(cloud_px_2, dtype=np.float64)
+
+    # Filter out far-away outliers (keeps descriptors/pixels in sync).
+    cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2 = filter_points_distance_quantile(
+        cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
+    )
 
     print(f"Initialized cloud with {cloud_points.shape[1]} points.")
     metrics["init"]["triangulated_kept"] = int(cloud_points.shape[1])
@@ -1092,6 +1149,12 @@ def run_sfm(
         else:
             print(f"Image {i} failed T estimation.")
 
+    # Optional final cleanup on the accumulated sparse cloud.
+    if filter_final_cloud:
+        final_points, _, _, _, _ = filter_points_distance_quantile(
+            cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
+        )
+
     # ========================================================
     # Output & Visualization
     # ========================================================
@@ -1158,5 +1221,5 @@ def run_all_datasets(start=1, end=9, *, visualize=False, use_roma_dense=True, sa
             print(f"Dataset {d} error: {e}")
 
 if __name__ == "__main__":
-    # run_all_datasets(1, 7, visualize=False, use_roma_dense=True, save_plot_dir="./sfm_plots_copy")
-    run_sfm(7, visualize=True, use_roma_dense=True, save_plot_dir="./output")
+    run_all_datasets(1, 9, visualize=False, use_roma_dense=True, save_plot_dir="./sfm_plots_new")
+    # run_sfm(7, visualize=True, use_roma_dense=True, save_plot_dir="./output", seed=40)

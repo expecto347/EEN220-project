@@ -215,13 +215,33 @@ def run_dense_reconstruction_roma(
         with np.errstate(all="ignore"):
             X = (X_h[:3, :] / X_h[3:4, :]).astype(np.float64, copy=False)
 
+        # === Parallax Angle Filter (Triangulation Angle) ===
+        # Compute the angle between rays (CamCenter -> X) in world coordinates.
+        # Small angles indicate short baseline / far points and are numerically unstable.
+        CA = (-RA.T @ tA).reshape(3, 1)
+        CB = (-RB.T @ tB).reshape(3, 1)
+
+        vecA = X - CA  # (3, N)
+        vecB = X - CB  # (3, N)
+        normA = np.linalg.norm(vecA, axis=0)
+        normB = np.linalg.norm(vecB, axis=0)
+        dot_prod = np.sum(vecA * vecB, axis=0)
+        with np.errstate(all="ignore"):
+            cos_angle = dot_prod / (normA * normB + 1e-12)
+            angles = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+        min_angle_rad = np.deg2rad(1.0)
+        angle_mask = angles > min_angle_rad
+        # ================================================
+
         finite = np.all(np.isfinite(X), axis=0)
-        if not np.any(finite):
+
+        valid_mask = finite & angle_mask
+        if not np.any(valid_mask):
             pairs_skipped += 1
             continue
 
-        X = X[:, finite]
-        ptsA_f = ptsA[finite, :]
+        X = X[:, valid_mask]
+        ptsA_f = ptsA[valid_mask, :]
 
         # Cheirality + sanity bounds.
         X_camA = (RA @ X) + tA

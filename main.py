@@ -4,19 +4,19 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import os
 import random
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
+
 from project_helpers import get_dataset_info
 from project_helpers import homography_to_RT
 from project_helpers import correct_H_sign
 
+# ==========================================
+# Global Utilities
+# ==========================================
 
 def set_global_seed(seed: int, *, deterministic_cv2: bool = False) -> None:
-    """Best-effort global seeding for reproducibility.
-
-    Notes:
-    - Our RANSAC loops use a local NumPy Generator when provided (preferred).
-    - This function also seeds Python's `random` and OpenCV's RNG (if available).
-    - `deterministic_cv2=True` forces single-thread OpenCV to reduce nondeterminism.
-    """
+    """Best-effort global seeding for reproducibility."""
     seed_i = int(seed)
     np.random.seed(seed_i)
     random.seed(seed_i)
@@ -41,29 +41,316 @@ def _make_rng(seed: int | None = None, rng: np.random.Generator | None = None) -
 
 
 def _imread_color_no_exif_rotation(path: str):
+    """Reads an image ensuring no auto-rotation from EXIF data."""
     flags = cv2.IMREAD_COLOR
-    # OpenCV may auto-rotate based on EXIF orientation; disable for consistency.
     if hasattr(cv2, "IMREAD_IGNORE_ORIENTATION"):
         flags |= cv2.IMREAD_IGNORE_ORIENTATION
     return cv2.imread(path, flags)
 
-# Optional dense reconstruction (RoMa)
-try:
-    from roma_dense import run_dense_reconstruction_roma, save_ply
-    ROMA_DENSE_AVAILABLE = True
-except Exception:
-    run_dense_reconstruction_roma = None
-    save_ply = None
-    ROMA_DENSE_AVAILABLE = False
+
+def _camera_center_world(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Camera center in world coordinates for x_cam = R X_world + t."""
+    R = np.asarray(R, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64).reshape(3)
+    return (-R.T @ t).reshape(3)
+
+
+def _min_parallax_mask_from_centers(
+    X_world: np.ndarray,
+    C1: np.ndarray,
+    C2: np.ndarray,
+    *,
+    min_angle_deg: float = 1.5,
+) -> np.ndarray:
+    """Return mask of points with parallax angle >= min_angle_deg.
+
+    Uses viewing rays (X - C1) and (X - C2) in world frame.
+    """
+    X = np.asarray(X_world, dtype=np.float64)
+    if X.ndim != 2 or X.shape[0] != 3:
+        return np.zeros((0,), dtype=bool)
+    n = int(X.shape[1])
+    if n == 0:
+        return np.zeros((0,), dtype=bool)
+
+    C1 = np.asarray(C1, dtype=np.float64).reshape(3, 1)
+    C2 = np.asarray(C2, dtype=np.float64).reshape(3, 1)
+    v1 = X - C1
+    v2 = X - C2
+    n1 = np.linalg.norm(v1, axis=0)
+    n2 = np.linalg.norm(v2, axis=0)
+
+    # Angle >= min_angle  <=>  cos(angle) <= cos(min_angle)
+    min_angle_rad = np.deg2rad(float(min_angle_deg))
+    cos_thresh = float(np.cos(min_angle_rad))
+
+    with np.errstate(all="ignore"):
+        dot = np.sum(v1 * v2, axis=0)
+        denom = (n1 * n2) + 1e-12
+        cosang = dot / denom
+
+    finite = np.isfinite(cosang) & np.isfinite(n1) & np.isfinite(n2)
+    finite &= (n1 > 1e-12) & (n2 > 1e-12)
+    # Clamp only for numeric stability; thresholding uses the unclamped value.
+    cosang = np.clip(cosang, -1.0, 1.0)
+    return finite & (cosang <= cos_thresh)
+
 
 # ==========================================
-# 辅助函数 / 核心算法实现
+# Dense Reconstruction Module (RoMa)
+# ==========================================
+
+@dataclass(frozen=True)
+class DenseReconstructionResult:
+    points_3d: np.ndarray  # 3xN float
+    colors_rgb: Optional[np.ndarray]  # Nx3 uint8 (or None)
+    pairs_processed: int
+    pairs_skipped: int
+
+
+def _round_to_multiple(x: int, m: int) -> int:
+    if m <= 1:
+        return int(x)
+    return int(((int(x) + m - 1) // m) * m)
+
+
+def _resize_hw_to_max(h: int, w: int, max_size: int) -> Tuple[int, int]:
+    if max_size <= 0:
+        return int(h), int(w)
+    max_dim = max(h, w)
+    if max_dim <= max_size:
+        return int(h), int(w)
+    s = float(max_size) / float(max_dim)
+    h2 = max(1, int(round(h * s)))
+    w2 = max(1, int(round(w * s)))
+    return h2, w2
+
+
+def _get_torch_device():
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    return torch, device
+
+
+def _build_roma_model(img_path: str, *, downsample_max_size: int):
+    """Build a RoMa model following the demo defaults."""
+    import torch
+    from PIL import Image
+    from romatch import roma_outdoor
+
+    _, device = _get_torch_device()
+
+    w, h = Image.open(img_path).size
+    h2, w2 = _resize_hw_to_max(h, w, int(downsample_max_size))
+    # RoMa models typically prefer resolutions divisible by 8/16.
+    h2 = _round_to_multiple(h2, 8)
+    w2 = _round_to_multiple(w2, 8)
+
+    roma_model = roma_outdoor(device=device, coarse_res=560, upsample_res=(h2, w2))
+    return roma_model, torch, device
+
+
+def _safe_match(roma_model, im1_path: str, im2_path: str, *, device):
+    """Call roma_model.match with best-effort signature compatibility."""
+    try:
+        return roma_model.match(im1_path, im2_path, device=device)
+    except TypeError:
+        return roma_model.match(im1_path, im2_path)
+
+
+def run_dense_reconstruction_roma(
+    dataset_num: int,
+    cameras_pose: dict,
+    K: np.ndarray,
+    img_names: Sequence[str],
+    *,
+    confidence_thresh: float = 0.7,
+    downsample_max_size: int = 1024,
+    max_points_per_pair: int = 25000,
+    seed: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> Optional[DenseReconstructionResult]:
+    """Create a denser point cloud using RoMa matches + known camera poses."""
+    
+    # Assume imports work as environment is pre-configured
+    from PIL import Image
+    
+    if K is None or len(img_names) == 0 or cameras_pose is None:
+        return None
+
+    if rng is None:
+        rng = np.random.default_rng(None if seed is None else int(seed))
+
+    # Pick pairs among localized images: (i_k, i_{k+1}) in index order.
+    localized = sorted(int(i) for i in cameras_pose.keys())
+    if len(localized) < 2:
+        return None
+
+    # Build RoMa model once
+    roma_model, torch, device = _build_roma_model(
+        img_names[localized[0]],
+        downsample_max_size=downsample_max_size,
+    )
+
+    points_all = []
+    colors_all = []
+    pairs_processed = 0
+    pairs_skipped = 0
+    K = np.asarray(K, dtype=np.float64)
+
+    for a, b in zip(localized[:-1], localized[1:]):
+        if a < 0 or b < 0 or a >= len(img_names) or b >= len(img_names):
+            pairs_skipped += 1
+            continue
+
+        imA_path = img_names[a]
+        imB_path = img_names[b]
+
+        try:
+            wA, hA = Image.open(imA_path).size
+            wB, hB = Image.open(imB_path).size
+            
+            warp, certainty = _safe_match(roma_model, imA_path, imB_path, device=device)
+            matches, cert_s = roma_model.sample(warp, certainty)
+            kptsA, kptsB = roma_model.to_pixel_coordinates(matches, hA, wA, hB, wB)
+        except Exception as e:
+            print(f"Skipping pair {a}-{b} due to error: {e}")
+            pairs_skipped += 1
+            continue
+
+        kptsA = kptsA.detach().cpu().numpy().astype(np.float64, copy=False)
+        kptsB = kptsB.detach().cpu().numpy().astype(np.float64, copy=False)
+        cert_s = cert_s.detach().cpu().numpy().reshape(-1)
+
+        # Filter by confidence + finiteness + bounds.
+        mask = np.isfinite(cert_s) & (cert_s >= float(confidence_thresh))
+        mask &= np.all(np.isfinite(kptsA), axis=1) & np.all(np.isfinite(kptsB), axis=1)
+        mask &= (kptsA[:, 0] >= 0) & (kptsA[:, 0] < wA) & (kptsA[:, 1] >= 0) & (kptsA[:, 1] < hA)
+        mask &= (kptsB[:, 0] >= 0) & (kptsB[:, 0] < wB) & (kptsB[:, 1] >= 0) & (kptsB[:, 1] < hB)
+
+        idx = np.where(mask)[0]
+        if idx.size < 16:
+            pairs_skipped += 1
+            continue
+
+        if max_points_per_pair > 0 and idx.size > max_points_per_pair:
+            idx = rng.choice(idx, int(max_points_per_pair), replace=False)
+
+        ptsA = kptsA[idx, :]
+        ptsB = kptsB[idx, :]
+
+        # Projection matrices in pixel coordinates.
+        RA, tA = cameras_pose[a]
+        RB, tB = cameras_pose[b]
+        PA = K @ np.hstack([np.asarray(RA), np.asarray(tA).reshape(3,1)])
+        PB = K @ np.hstack([np.asarray(RB), np.asarray(tB).reshape(3,1)])
+
+        # Triangulate
+        X_h = cv2.triangulatePoints(PA, PB, ptsA.T, ptsB.T)
+        with np.errstate(all="ignore"):
+            X = (X_h[:3, :] / X_h[3:4, :]).astype(np.float64, copy=False)
+
+        # Filter points behind cameras or with small parallax angles
+        finite = np.all(np.isfinite(X), axis=0)
+        X = X[:, finite]
+        ptsA_f = ptsA[finite, :]
+        
+        # Simple Cheirality check
+        X_camA = (RA @ X) + tA.reshape(3,1)
+        X_camB = (RB @ X) + tB.reshape(3,1)
+        cheir = (X_camA[2, :] > 0) & (X_camB[2, :] > 0)
+        cheir &= np.all(np.abs(X) < 1e6, axis=0) # Remove points at infinity
+
+        if not np.any(cheir):
+            pairs_skipped += 1
+            continue
+
+        X = X[:, cheir]
+        ptsA_f = ptsA_f[cheir, :]
+
+        # Minimum triangulation parallax angle filter (world frame)
+        C_A = _camera_center_world(RA, tA)
+        C_B = _camera_center_world(RB, tB)
+        par_mask = _min_parallax_mask_from_centers(X, C_A, C_B, min_angle_deg=1.5)
+        if par_mask.size != X.shape[1] or (not np.any(par_mask)):
+            pairs_skipped += 1
+            continue
+        X = X[:, par_mask]
+        ptsA_f = ptsA_f[par_mask, :]
+
+        # Colors from image A
+        imgA = _imread_color_no_exif_rotation(imA_path)
+        if imgA is not None:
+            uu = np.clip(np.round(ptsA_f[:, 0]).astype(np.int32), 0, wA - 1)
+            vv = np.clip(np.round(ptsA_f[:, 1]).astype(np.int32), 0, hA - 1)
+            bgr = imgA[vv, uu, :]
+            colors = bgr[:, ::-1].copy()  # RGB
+            colors_all.append(colors)
+
+        points_all.append(X)
+        pairs_processed += 1
+
+    if pairs_processed == 0 or len(points_all) == 0:
+        return None
+
+    points_3d = np.hstack(points_all) if len(points_all) > 1 else points_all[0]
+    colors_rgb = np.vstack(colors_all).astype(np.uint8, copy=False) if colors_all else None
+
+    return DenseReconstructionResult(
+        points_3d=points_3d,
+        colors_rgb=colors_rgb,
+        pairs_processed=int(pairs_processed),
+        pairs_skipped=int(pairs_skipped),
+    )
+
+
+def save_ply(path: str, points_3d: np.ndarray, colors_rgb: Optional[np.ndarray] = None) -> None:
+    """Save a point cloud to an ASCII PLY file."""
+    pts = np.asarray(points_3d, dtype=np.float64)
+    n = int(pts.shape[1])
+    if n == 0:
+        return
+
+    cols = None
+    if colors_rgb is not None:
+        cols = np.asarray(colors_rgb)
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    header = [
+        "ply",
+        "format ascii 1.0",
+        f"element vertex {n}",
+        "property float x",
+        "property float y",
+        "property float z",
+    ]
+    if cols is not None:
+        header += ["property uchar red", "property uchar green", "property uchar blue"]
+    header += ["end_header"]
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(header) + "\n")
+        if cols is None:
+            for i in range(n):
+                f.write(f"{pts[0, i]:.6f} {pts[1, i]:.6f} {pts[2, i]:.6f}\n")
+        else:
+            cols = cols.astype(np.uint8, copy=False)
+            for i in range(n):
+                f.write(f"{pts[0, i]:.6f} {pts[1, i]:.6f} {pts[2, i]:.6f} {cols[i, 0]} {cols[i, 1]} {cols[i, 2]}\n")
+
+
+# ==========================================
+# Core Algorithm Implementation (SfM)
 # ==========================================
 
 def estimate_H_DLT(x1, x2):
     """
-    使用 DLT 算法从至少 4 对点估计单应性矩阵 H [cite: 144]。
-    x1, x2: 3xN 归一化坐标
+    Estimate Homography H using DLT algorithm from at least 4 point pairs.
+    x1, x2: 3xN normalized coordinates.
     """
     x1 = np.asarray(x1, dtype=np.float64)
     x2 = np.asarray(x2, dtype=np.float64)
@@ -77,7 +364,7 @@ def estimate_H_DLT(x1, x2):
     if n < 4:
         return None
 
-    # Hartley normalization improves numerical stability (important for near-planar scenes).
+    # Hartley normalization improves numerical stability
     T1, x1n = _hartley_normalize_2d(x1)
     T2, x2n = _hartley_normalize_2d(x2)
 
@@ -128,9 +415,7 @@ def _symmetric_transfer_errors_sq(H, x1s, x2s):
     H = np.asarray(H, dtype=np.float64)
     x1s = np.asarray(x1s, dtype=np.float64)
     x2s = np.asarray(x2s, dtype=np.float64)
-    if H.shape != (3, 3) or x1s.shape[0] != 3 or x2s.shape[0] != 3:
-        return None
-
+    
     with np.errstate(all='ignore'):
         x2p = H @ x1s
     x2p_i = _to_inhomogeneous_2d(x2p)
@@ -182,28 +467,29 @@ def _cheirality_positive_count(R, t, x1s, x2s, inliers, *, max_points=50, rng: n
             pos += 1
     return int(pos), int(checked)
 
+
 def check_pose_inliers(R, t, x1, x2, threshold_sq):
     """
-    辅助函数：检查给定 (R, t) 的内点数和几何有效性。
-    用于评估来自 E 或 H 的解 [cite: 147, 161]。
+    Helper function: Check inlier count and geometric validity for a given (R, t).
+    Used to evaluate solutions from E or H.
     """
     t = t.reshape(3, 1)
-    # 构建本质矩阵 E = [t]x R
+    # Construct Essential Matrix E = [t]x R
     Tx = np.array([[0, -t[2,0], t[1,0]],
                    [t[2,0], 0, -t[0,0]],
                    [-t[1,0], t[0,0], 0]])
     E_hyp = Tx @ R
     
-    # 1. 计算 Sampson 误差确定内点 [cite: 147]
+    # 1. Compute Sampson error to determine inliers
     d2 = compute_sampson_errors(E_hyp, x1, x2)
     inliers = d2 < threshold_sq
     count = np.sum(inliers)
     
-    # 如果内点太少，跳过昂贵的三角化检查
+    # If too few inliers, skip expensive triangulation check
     if count < 8:
         return 0, inliers, False
 
-    # 2. Cheirality 检查：用多个内点更稳健（平面/小基线时单点容易误判）
+    # 2. Cheirality check: Use multiple inliers for robustness (prevents failure on planar scenes)
     pos, checked = _cheirality_positive_count(R, t, x1, x2, inliers, max_points=25)
     if checked == 0:
         return int(count), inliers, False
@@ -212,10 +498,11 @@ def check_pose_inliers(R, t, x1, x2, threshold_sq):
     is_valid = (pos >= 5) and (frac >= 0.6)
     return int(count), inliers, bool(is_valid)
 
+
 def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000, *, rng: np.random.Generator | None = None):
     """
-    并行 RANSAC：同时搜索 E (8点法) 和 H (4点法) [cite: 138, 152]。
-    直接返回最佳的 (R, t) 以及内点掩码。
+    Parallel RANSAC: Simultaneously search for E (8-point) and H (4-point).
+    Returns the best (R, t) and the inlier mask directly.
     """
     threshold_sq = threshold ** 2
     n_points = x1s.shape[1]
@@ -227,32 +514,31 @@ def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000, *, 
     if n_points < 8:
         return None, None, None
 
-    # 预先构建 Identity 矩阵用于 select_correct_pose
+    # Pre-build Identity matrix for select_correct_pose
     P1_identity = np.eye(4)[:3]
 
     rng = _make_rng(rng=rng)
     for _ in range(num_iterations):
-        # 1. 采样 8 个点 (E 需要 8 个，H 只需要其中 4 个)
+        # 1. Sample 8 points (E needs 8, H needs 4 of these)
         sample_idx = rng.choice(n_points, 8, replace=False)
         x1_sample, x2_sample = x1s[:, sample_idx], x2s[:, sample_idx]
         
         # ==========================================
-        # 分支 A: 估计 Essential Matrix (8-point) [cite: 142]
+        # Branch A: Estimate Essential Matrix (8-point)
         # ==========================================
         E_approx = estimate_F_DLT(x1_sample, x2_sample)
         E_cand = enforce_essential(E_approx)
         
         if E_cand is not None:
-            # 分解 E 得到 4 个解
+            # Decompose E into 4 possible solutions
             candidates = extract_P_from_E(E_cand)
             
-            # 使用 Cheirality 选出唯一解 (R, t) (针对样本集) [cite: 147]
-            # 这里复用现有的 select_correct_pose 快速筛选
+            # Use Cheirality to pick the unique solution (R, t) for the sample
             res = select_correct_pose(candidates, P1_identity, x1_sample, x2_sample)
             
             if res is not None:
                 R_E, t_E = res
-                # 在所有数据点上评分
+                # Score against all data points
                 count, inliers, valid = check_pose_inliers(R_E, t_E, x1s, x2s, threshold_sq)
                 
                 if valid and count > best_score:
@@ -261,80 +547,51 @@ def ransac_estimate_parallel(x1s, x2s, threshold=0.001, num_iterations=2000, *, 
                     best_inliers = inliers
 
         # ==========================================
-        # 分支 B: 估计 Homography (4-point) [cite: 144]
+        # Branch B: Estimate Homography (4-point)
         # ==========================================
-        # 使用样本的前4个点
+        # Use first 4 points of the sample
         H_cand = estimate_H_DLT(x1_sample[:, :4], x2_sample[:, :4])
         
         if H_cand is not None:
-            # Stabilize sign for decomposition.
+            # Stabilize sign for decomposition
             try:
                 H_cand = correct_H_sign(H_cand, x1_sample[:, :4], x2_sample[:, :4])
             except Exception:
                 pass
 
-            # 从 H 分解出可能的 (R, t) 列表 [cite: 145]
-            # homography_to_RT 返回 [(R1, t1), (R2, t2), ...]
+            # Decompose H into possible (R, t) list
             try:
                 RTs = homography_to_RT(H_cand)
                 RTs = np.asarray(RTs)
-                # project_helpers.homography_to_RT returns shape (2, 3, 4): [R|t] for 2 hypotheses.
+                
+                # If decomposition succeeds
                 if RTs.ndim == 3 and RTs.shape[1:] == (3, 4):
-                    # Score H by symmetric transfer error (more appropriate for planar scenes).
+                    # Score H by symmetric transfer error
                     d2_h = _symmetric_transfer_errors_sq(H_cand, x1s, x2s)
                     if d2_h is None:
                         continue
                     inliers_h = d2_h < (2.0 * threshold_sq)
                     count_h = int(np.sum(inliers_h))
 
+                    # Check each hypothesis from H decomposition
                     for k in range(RTs.shape[0]):
                         R_H = RTs[k, :, :3]
                         t_H = RTs[k, :, 3]
-                        # Cheirality validation using H-inliers.
+                        
+                        # Cheirality validation using H-inliers
                         pos, checked = _cheirality_positive_count(
-                            R_H,
-                            t_H,
-                            x1s,
-                            x2s,
-                            inliers_h,
-                            max_points=50,
-                            rng=rng,
+                            R_H, t_H, x1s, x2s, inliers_h, max_points=50, rng=rng
                         )
                         valid = (checked > 0) and (pos >= 8) and ((pos / checked) >= 0.6)
+                        
                         if valid and count_h > best_score:
                             best_score = count_h
                             best_Rt = (R_H, t_H)
                             best_inliers = inliers_h
             except Exception:
-                pass # 忽略分解失败的情况，继续循环
+                pass # Ignore H decomposition failures
 
     return best_Rt[0], best_Rt[1], best_inliers
-
-def _error_stats(errors_px):
-    """Return robust summary stats for a 1D array of pixel errors."""
-    if errors_px is None:
-        return {"n": 0}
-    arr = np.asarray(errors_px, dtype=np.float64).ravel()
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return {"n": 0}
-    return {
-        "n": int(arr.size),
-        "mean": float(np.mean(arr)),
-        "median": float(np.median(arr)),
-        "p90": float(np.percentile(arr, 90)),
-        "p95": float(np.percentile(arr, 95)),
-        "max": float(np.max(arr)),
-    }
-
-
-def _format_stats(stats):
-    if not stats or stats.get("n", 0) == 0:
-        return "n=0"
-    return (
-        f"n={stats['n']} median={stats['median']:.2f}px "
-        f"p95={stats['p95']:.2f}px max={stats['max']:.2f}px"
-    )
 
 
 def _reprojection_errors_px(object_points, image_points, R, t, K):
@@ -397,10 +654,7 @@ def _to_inhomogeneous_2d(x_h):
 
 
 def _hartley_normalize_2d(x_h):
-    """Hartley isotropic normalization for 2D homogeneous points.
-
-    Returns (T, x_norm) where x_norm = T @ x_h.
-    """
+    """Hartley isotropic normalization for 2D homogeneous points."""
     x_h = np.asarray(x_h, dtype=np.float64)
     if x_h.shape[0] == 2:
         x_h = np.vstack([x_h, np.ones((1, x_h.shape[1]), dtype=np.float64)])
@@ -415,10 +669,7 @@ def _hartley_normalize_2d(x_h):
     dx = xf - centroid.reshape(2, 1)
     d = np.sqrt(np.sum(dx * dx, axis=0))
     mean_d = float(np.mean(d)) if d.size else 0.0
-    if not np.isfinite(mean_d) or mean_d < 1e-12:
-        s = 1.0
-    else:
-        s = np.sqrt(2.0) / mean_d
+    s = 1.0 if (not np.isfinite(mean_d) or mean_d < 1e-12) else (np.sqrt(2.0) / mean_d)
 
     T = np.array([
         [s, 0.0, -s * centroid[0]],
@@ -431,11 +682,7 @@ def _hartley_normalize_2d(x_h):
 
 
 def estimate_F_DLT(x1s, x2s):
-    """Estimate Fundamental/Essential matrix using normalized 8-point algorithm.
-
-    NOTE: When x1s/x2s are already in camera-normalized coordinates, this
-    effectively estimates the Essential matrix up to scale.
-    """
+    """Estimate Fundamental/Essential matrix using normalized 8-point algorithm."""
     valid_idx = np.all(np.isfinite(x1s), axis=0) & np.all(np.isfinite(x2s), axis=0)
     x1 = np.asarray(x1s[:, valid_idx], dtype=np.float64)
     x2 = np.asarray(x2s[:, valid_idx], dtype=np.float64)
@@ -444,7 +691,6 @@ def estimate_F_DLT(x1s, x2s):
     if n_points < 8:
         return None
 
-    # Hartley normalization improves numerical stability.
     T1, x1n = _hartley_normalize_2d(x1)
     T2, x2n = _hartley_normalize_2d(x2)
 
@@ -467,7 +713,7 @@ def estimate_F_DLT(x1s, x2s):
     _, _, Vt = np.linalg.svd(M)
     F = Vt[-1, :].reshape(3, 3)
 
-    # Enforce rank-2 constraint before denormalization.
+    # Enforce rank-2 constraint
     U, S, Vt = np.linalg.svd(F)
     S[2] = 0.0
     F_rank2 = U @ np.diag(S) @ Vt
@@ -481,17 +727,14 @@ def enforce_essential(E_approx):
     """Enforce singular values (1,1,0) for Essential Matrix."""
     if E_approx is None: return None
     U, S, Vt = np.linalg.svd(E_approx)
-    if np.linalg.det(U @ Vt) < 0: Vt = -Vt # Ensure proper rotation component
+    if np.linalg.det(U @ Vt) < 0: Vt = -Vt 
     S_new = np.diag([1, 1, 0])
     E_constrained = U @ S_new @ Vt
     return E_constrained
 
 
 def compute_sampson_errors(E, x1s, x2s):
-    """Compute Sampson approximation of geometric reprojection error.
-
-    Returns squared Sampson errors (in normalized image coordinates).
-    """
+    """Compute Sampson approximation of geometric reprojection error (squared)."""
     E = np.asarray(E, dtype=np.float64)
     x1s = np.asarray(x1s, dtype=np.float64)
     x2s = np.asarray(x2s, dtype=np.float64)
@@ -507,41 +750,8 @@ def compute_sampson_errors(E, x1s, x2s):
     return d2
 
 
-def ransac_estimate_E(x1s, x2s, threshold=0.001, num_iterations=2000, *, rng: np.random.Generator | None = None):
-    """
-    RANSAC loop for Essential Matrix estimation[cite: 117, 139].
-    x1s, x2s: Normalized coordinates (3xN)
-    """
-    best_E, best_inliers = None, None
-    max_inliers_count = 0
-    n_points = x1s.shape[1]
-    
-    rng = _make_rng(rng=rng)
-    # 简单的随机采样
-    for _ in range(num_iterations):
-        if n_points < 8: break
-        sample_idx = rng.choice(n_points, 8, replace=False)
-        x1_sample, x2_sample = x1s[:, sample_idx], x2s[:, sample_idx]
-        
-        E_approx = estimate_F_DLT(x1_sample, x2_sample)
-        E_cand = enforce_essential(E_approx)
-        if E_cand is None: continue
-        
-        # Use Sampson distance (squared) for more stable inlier selection.
-        d2 = compute_sampson_errors(E_cand, x1s, x2s)
-        inliers = d2 < (threshold ** 2)
-        inliers_count = np.sum(inliers)
-        
-        if inliers_count > max_inliers_count:
-            max_inliers_count = inliers_count
-            best_E = E_cand
-            best_inliers = inliers
-            
-    return best_E, best_inliers
-
-
 def extract_P_from_E(E):
-     """Extract 4 possible camera matrices P2 from E[cite: 143, 123]."""
+     """Extract 4 possible camera matrices P2 from E."""
      U, S, Vt = np.linalg.svd(E)
      if np.linalg.det(U @ Vt) < 0: Vt = -Vt
      W = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
@@ -571,10 +781,7 @@ def triangulate_point_DLT(P1, P2, point1, point2):
 
 
 def select_correct_pose(candidates, P1, points1, points2):
-    """
-    Select the correct (R, t) configuration using Cheirality check[cite: 128, 147].
-    Points must be in front of both cameras.
-    """
+    """Select the correct (R, t) configuration using Cheirality check."""
     best_Rt = None
     max_positive_depths = -1
     
@@ -600,7 +807,7 @@ def select_correct_pose(candidates, P1, points1, points2):
 
 def estimate_T_linear(points2D, points3D, R):
     """
-    Linear estimation of T given R and 2D-3D matches[cite: 41, 106].
+    Linear estimation of T given R and 2D-3D matches.
     Equation: lambda * x = R X + T
     """
     points2D = np.asarray(points2D, dtype=np.float64)
@@ -630,8 +837,7 @@ def estimate_T_linear(points2D, points3D, R):
         u, v = points2D[0, i], points2D[1, i]
         Xr, Yr, Zr = X_rotated[:, i]
         
-        # Eliminating lambda (depth):
-        # u = (Xr + Tx)/(Zr + Tz) -> Tx - u*Tz = u*Zr - Xr
+        # Eliminating lambda (depth): u = (Xr + Tx)/(Zr + Tz)
         A[2*i, 0] = 1        # Tx
         A[2*i, 1] = 0        # Ty
         A[2*i, 2] = -u       # Tz
@@ -648,7 +854,7 @@ def estimate_T_linear(points2D, points3D, R):
 
 def estimate_T_robust(points2D, points3D, R, threshold=0.005, num_iterations=1000, *, rng: np.random.Generator | None = None):
     """
-    Robustly estimate T using RANSAC[cite: 106, 129].
+    Robustly estimate T using RANSAC (Reduced camera resectioning).
     points2D should be NORMALIZED coordinates.
     """
     points2D = np.asarray(points2D, dtype=np.float64)
@@ -673,7 +879,7 @@ def estimate_T_robust(points2D, points3D, R, threshold=0.005, num_iterations=100
     
     rng = _make_rng(rng=rng)
     for i in range(num_iterations):
-        # 1. Minimal sample (2 points) [cite: 106]
+        # 1. Minimal sample (2 points)
         idx = rng.choice(N, 2, replace=False)
         sample_2d = points2D[:, idx]
         sample_3d = points3D[:, idx]
@@ -709,7 +915,7 @@ def estimate_T_robust(points2D, points3D, R, threshold=0.005, num_iterations=100
 
 
 # ==========================================
-# 匹配和辅助逻辑
+# Matching and Auxiliary Logic
 # ==========================================
 
 def _collect_2d3d_correspondences(cloud_des, cloud_points, cloud_ref_px, des_i, kp_i, ratio=0.75):
@@ -767,10 +973,7 @@ def filter_points_distance_quantile(
     factor=5.0,
     quantile=90,
 ):
-    """Filters 3D points based on distance from the center of gravity.
-
-    Rule: || X - mean(X) || <= factor * (quantile of distances)
-    """
+    """Filters 3D points based on distance from the center of gravity."""
     if cloud_points is None:
         return cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
 
@@ -799,7 +1002,7 @@ def filter_points_distance_quantile(
     if n_removed > 0:
         print(f"  [Filter] Removed {n_removed} points > {limit:.2f} units from center.")
 
-    # 5. Apply Mask to all associated arrays
+    # 5. Apply Mask
     new_points = cloud_points[:, mask]
     new_des_1 = cloud_des_1[mask] if cloud_des_1 is not None else None
     new_des_2 = cloud_des_2[mask] if cloud_des_2 is not None else None
@@ -807,6 +1010,7 @@ def filter_points_distance_quantile(
     new_px_2 = cloud_px_2[mask] if cloud_px_2 is not None else None
 
     return new_points, new_des_1, new_des_2, new_px_1, new_px_2
+
 
 def _merge_unique_correspondences(corr_lists):
     all_corr = []
@@ -826,6 +1030,7 @@ def _merge_unique_correspondences(corr_lists):
         valid_2d.append(pt_img)
         valid_3d.append(pt_3d)
     return valid_2d, valid_3d
+
 
 def plot_3d_reconstruction_maybe(points_3d, cameras, *, show=True, save_path=None):
     if (not show) and (save_path is None):
@@ -882,7 +1087,6 @@ def run_sfm(
     if K is None: return
 
     if seed is not None:
-        # Seed once per run for reproducibility.
         set_global_seed(int(seed), deterministic_cv2=True)
     rng = _make_rng(seed=seed)
 
@@ -901,7 +1105,7 @@ def run_sfm(
         images.append(img)
     print(f"Loaded {len(images)} images.")
     
-    # 计算归一化阈值 (Project suggestion: threshold / f) [cite: 212]
+    # Calculate normalized threshold (Project suggestion: threshold / f)
     focal_length = (K[0,0] + K[1,1]) / 2.0
     norm_threshold = float(pixel_threshold) / focal_length
 
@@ -919,11 +1123,11 @@ def run_sfm(
     pts1_good = np.float32([ kp1[m.queryIdx].pt for m in good_matches ]).T
     pts2_good = np.float32([ kp2[m.trainIdx].pt for m in good_matches ]).T
     
-    # 2.1 归一化坐标 
+    # 2.1 Normalized Coordinates
     pts1_good_n = normalize_points(pts1_good, K)
     pts2_good_n = normalize_points(pts2_good, K)
     
-    # 2.2 使用并行 RANSAC (同时搜索 E 和 H) [cite: 138]
+    # 2.2 Parallel RANSAC (Search for E and H simultaneously)
     print(f"Running Parallel RANSAC on {pts1_good_n.shape[1]} matches...")
     R_rel, t_rel, inlier_mask_init = ransac_estimate_parallel(
         pts1_good_n, pts2_good_n, threshold=norm_threshold, rng=rng
@@ -934,7 +1138,7 @@ def run_sfm(
         metrics["summary"]["status"] = "failed_init_pose"
         return metrics
 
-    # 并行 RANSAC 直接返回了最佳位姿，不需要再做分解和选择
+    # Parallel RANSAC returns best pose directly
     P1 = np.eye(4)[:3]
     P2 = np.hstack((R_rel, t_rel.reshape(3, 1)))
     
@@ -942,7 +1146,7 @@ def run_sfm(
     metrics["init"]["E_inliers"] = init_inliers
     print(f"Parallel RANSAC found {init_inliers} inliers.")
 
-    # 2.4 Triangulate inliers (后续代码保持不变)
+    # 2.4 Triangulate inliers
     cloud_points = []
     cloud_des_1 = []
     cloud_des_2 = []
@@ -957,6 +1161,12 @@ def run_sfm(
     
     match_indices = np.array(good_matches)[inlier_mask_init]
 
+    # Minimum triangulation parallax angle filter (in degrees)
+    min_parallax_deg = 1.5
+    C1_init = np.zeros(3, dtype=np.float64)
+    C2_init = _camera_center_world(R_rel, t_rel)
+    cos_thresh_init = float(np.cos(np.deg2rad(min_parallax_deg)))
+
     for i in range(p1_in.shape[1]):
         X_h = triangulate_point_DLT(P1, P2, p1_in[:, i], p2_in[:, i])
         X = X_h[:3]
@@ -964,8 +1174,22 @@ def run_sfm(
         # Cheirality Check (Depth > 0)
         X_cam2 = R_rel @ X + t_rel
         if X[2] > 0 and X_cam2[2] > 0:
+            # Parallax angle filter (avoid near-zero baseline triangulation)
+            v1 = X - C1_init
+            v2 = X - C2_init
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if (not np.isfinite(n1)) or (not np.isfinite(n2)) or (n1 < 1e-12) or (n2 < 1e-12):
+                continue
+            with np.errstate(all="ignore"):
+                cosang = float(np.dot(v1, v2) / (n1 * n2 + 1e-12))
+            if (not np.isfinite(cosang)):
+                continue
+            cosang = float(np.clip(cosang, -1.0, 1.0))
+            if cosang > cos_thresh_init:
+                continue
             cloud_points.append(X)
-            # 保存 descriptors 用于后续匹配
+            # Save descriptors for future matching
             cloud_des_1.append(des1[match_indices[i].queryIdx])
             cloud_des_2.append(des2[match_indices[i].trainIdx])
             cloud_px_1.append(kp1[match_indices[i].queryIdx].pt)
@@ -977,7 +1201,7 @@ def run_sfm(
     cloud_px_1 = np.array(cloud_px_1, dtype=np.float64)
     cloud_px_2 = np.array(cloud_px_2, dtype=np.float64)
 
-    # Filter out far-away outliers (keeps descriptors/pixels in sync).
+    # Filter out far-away outliers
     cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2 = filter_points_distance_quantile(
         cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
     )
@@ -986,14 +1210,13 @@ def run_sfm(
     metrics["init"]["triangulated_kept"] = int(cloud_points.shape[1])
 
     # ========================================================
-    # STEP 3: Resectioning loop (Sequential) [cite: 37, 38, 41]
+    # STEP 3: Resectioning loop (Sequential)
     # ========================================================
     cameras_pose = {}
     cameras_pose[idx1] = (np.eye(3), np.zeros(3))
     cameras_pose[idx2] = (R_rel, t_rel)
     
-    # 定义处理顺序：优先处理 init_pair 之间的图像（这对 dataset 2 很关键，init=(0,8) 否则队列为空）
-    # 然后再处理 init_pair 之外的两侧。
+    # Processing Order: Prioritize images between init_pair
     processing_queue = []
     step = 1 if idx2 > idx1 else -1
     processing_queue.extend(range(idx1 + step, idx2, step))
@@ -1008,7 +1231,6 @@ def run_sfm(
     
     for i in processing_queue:
         # Determine reference frame (neighbor that is already reconstructed)
-        # We need this to calculate Relative Rotation
         if (i - 1) in cameras_pose:
             ref_idx = i - 1
         elif (i + 1) in cameras_pose:
@@ -1022,8 +1244,8 @@ def run_sfm(
         kp_i, des_i = sift.detectAndCompute(images[i], None)
         kp_ref, des_ref = sift.detectAndCompute(images[ref_idx], None)
         
-        # 3.1 Calculate Relative Rotation using Essential Matrix RANSAC [cite: 37]
-        # (Needed because we must 'Upgrade to absolute rotations' before calculating T)
+        # 3.1 Calculate Relative Rotation using Parallel RANSAC (Essential Matrix)
+        # Needed for upgrading to absolute rotations before calculating T
         bf_seq = cv2.BFMatcher()
         matches_seq = bf_seq.knnMatch(des_ref, des_i, k=2)
         good_seq = [m for m, n in matches_seq if m.distance < 0.75 * n.distance]
@@ -1039,8 +1261,7 @@ def run_sfm(
         p_ref_n = normalize_points(p_ref_seq, K)
         p_i_n = normalize_points(p_i_seq, K)
 
-        # Robust pairwise pose for potentially planar scenes:
-        # Use parallel RANSAC (E vs H) to avoid degeneracy of E-only estimation.
+        # Robust pairwise pose for potentially planar scenes
         R_rel_seq, t_rel_seq, mask_seq = ransac_estimate_parallel(
             p_ref_n,
             p_i_n,
@@ -1052,21 +1273,16 @@ def run_sfm(
             print(f"Pose estimation failed (E/H parallel RANSAC) {ref_idx}-{i}")
             continue
                                                      
-        # 3.2 Upgrade to Absolute Rotation [cite: 38, 69]
-        # R_i = R_rel * R_ref (注意：这里的 R_rel 是 ref -> i 的旋转)
-        # Camera pose definition: X_cam = R * X_world + t
-        # X_i = R_rel * X_ref + t_rel
-        # X_i = R_rel * (R_ref * X_w + t_ref) + t_rel
-        # X_i = (R_rel * R_ref) * X_w + ...
+        # 3.2 Upgrade to Absolute Rotation
+        # R_i = R_rel * R_ref (Note: R_rel here is ref -> i)
         R_ref_abs, _ = cameras_pose[ref_idx]
         R_i_abs = R_rel_seq @ R_ref_abs
         
-        # 3.3 Robustly calculate Translation T using 2D-3D matches [cite: 41, 106]
+        # 3.3 Robustly calculate Translation T using 2D-3D matches
         # Collect matches between Image i and existing Cloud
         corr1 = _collect_2d3d_correspondences(cloud_des_1, cloud_points, cloud_px_1, des_i, kp_i)
         corr2 = _collect_2d3d_correspondences(cloud_des_2, cloud_points, cloud_px_2, des_i, kp_i)
         
-        # Use E-test filter provided in code? Skipped for brevity, rely on T-RANSAC
         valid_2d, valid_3d = _merge_unique_correspondences([corr1, corr2])
         
         if len(valid_2d) < 6:
@@ -1079,23 +1295,28 @@ def run_sfm(
         # Normalize 2D points for T estimation
         pts2d_norm = normalize_points(pts2d_np, K)
         
-        # Run custom T estimation [cite: 129]
+        # Run custom T estimation
         t_i_abs, t_inliers = estimate_T_robust(pts2d_norm, pts3d_np, R_i_abs, 
                                                threshold=norm_threshold*2.0,
-                                               rng=rng) # slightly looser for PnP
+                                               rng=rng)
         
         if t_i_abs is not None:
             num_inliers = np.sum(t_inliers)
             print(f"Image {i} localized. T-RANSAC Inliers: {num_inliers}/{pts2d_norm.shape[1]}")
             cameras_pose[i] = (R_i_abs, t_i_abs)
 
-            # 3.4 Grow the point cloud by triangulating new matches between ref and i.
-            # This is essential for multi-view datasets like #2.
+            # 3.4 Grow the point cloud by triangulating new matches between ref and i
             R_ref_w, t_ref_w = cameras_pose[ref_idx]
             P_ref = np.hstack([R_ref_w, np.asarray(t_ref_w, dtype=np.float64).reshape(3, 1)])
             P_i = np.hstack([R_i_abs, np.asarray(t_i_abs, dtype=np.float64).reshape(3, 1)])
 
-            # Use inliers from the pairwise pose estimation for triangulation candidates.
+            # For parallax thresholding on newly triangulated points
+            min_parallax_deg = 1.5
+            cos_thresh = float(np.cos(np.deg2rad(min_parallax_deg)))
+            C_ref = _camera_center_world(R_ref_w, t_ref_w)
+            C_i = _camera_center_world(R_i_abs, t_i_abs)
+
+            # Use inliers from the pairwise pose estimation for triangulation candidates
             in_mask = np.asarray(mask_seq, dtype=bool)
             if np.sum(in_mask) >= 8:
                 # Indices in keypoint arrays
@@ -1127,6 +1348,21 @@ def run_sfm(
                     if not np.all(np.isfinite(X)):
                         continue
 
+                    # Parallax angle filter
+                    v1 = X - C_ref
+                    v2 = X - C_i
+                    n1 = float(np.linalg.norm(v1))
+                    n2 = float(np.linalg.norm(v2))
+                    if (not np.isfinite(n1)) or (not np.isfinite(n2)) or (n1 < 1e-12) or (n2 < 1e-12):
+                        continue
+                    with np.errstate(all="ignore"):
+                        cosang = float(np.dot(v1, v2) / (n1 * n2 + 1e-12))
+                    if (not np.isfinite(cosang)):
+                        continue
+                    cosang = float(np.clip(cosang, -1.0, 1.0))
+                    if cosang > cos_thresh:
+                        continue
+
                     m = good_in[j]
                     X_new_list.append(X)
                     d_ref_list.append(des_ref[m.queryIdx])
@@ -1149,7 +1385,7 @@ def run_sfm(
         else:
             print(f"Image {i} failed T estimation.")
 
-    # Optional final cleanup on the accumulated sparse cloud.
+    # Optional final cleanup on the accumulated sparse cloud
     if filter_final_cloud:
         final_points, _, _, _, _ = filter_points_distance_quantile(
             cloud_points, cloud_des_1, cloud_des_2, cloud_px_1, cloud_px_2
@@ -1173,37 +1409,53 @@ def run_sfm(
     dense_cloud = None
     dense_colors = None
     if use_roma_dense:
-        if not ROMA_DENSE_AVAILABLE:
-            print("RoMa dense module not available; skipping. (Install torch + romatch, or check import)")
-        else:
-            dense_res = run_dense_reconstruction_roma(
-                int(dataset_num),
-                cameras_pose,
-                K,
-                img_names,
-                confidence_thresh=float(roma_confidence_thresh),
-                downsample_max_size=int(roma_downsample_max_size),
-                rng=rng,
-            )
-            if dense_res is not None:
-                dense_cloud = dense_res.points_3d
-                dense_colors = dense_res.colors_rgb
-                metrics["summary"]["dense_points"] = int(dense_cloud.shape[1])
-                metrics["summary"]["dense_pairs_processed"] = int(dense_res.pairs_processed)
-                metrics["summary"]["dense_pairs_skipped"] = int(dense_res.pairs_skipped)
+        dense_res = run_dense_reconstruction_roma(
+            int(dataset_num),
+            cameras_pose,
+            K,
+            img_names,
+            confidence_thresh=float(roma_confidence_thresh),
+            downsample_max_size=int(roma_downsample_max_size),
+            rng=rng,
+        )
+        if dense_res is not None:
+            dense_cloud = dense_res.points_3d
+            dense_colors = dense_res.colors_rgb
+            metrics["summary"]["dense_points"] = int(dense_cloud.shape[1])
+            metrics["summary"]["dense_pairs_processed"] = int(dense_res.pairs_processed)
+            metrics["summary"]["dense_pairs_skipped"] = int(dense_res.pairs_skipped)
 
-                if save_plot_dir:
-                    ply_path = os.path.join(save_plot_dir, f"dense_{dataset_num}.ply")
-                    save_ply(ply_path, dense_cloud, dense_colors)
-                    print(f"Saved dense point cloud to {ply_path}")
-            else:
-                print("RoMa dense ran but returned no points (missing deps or too few confident matches).")
+            if save_plot_dir:
+                ply_path = os.path.join(save_plot_dir, f"dense_{dataset_num}.ply")
+                save_ply(ply_path, dense_cloud, dense_colors)
+                print(f"Saved dense point cloud to {ply_path}")
+        else:
+            print("RoMa dense ran but returned no points (check dependencies or match confidence).")
     
     points_to_plot = dense_cloud if dense_cloud is not None else final_points
 
     if visualize or save_plot_dir:
         save_path = os.path.join(save_plot_dir, f"res_{dataset_num}.png") if save_plot_dir else None
         plot_3d_reconstruction_maybe(points_to_plot, cam_centers, show=visualize, save_path=save_path)
+        
+    print("\n" + "="*50)
+    print(f"FINAL RESULTS FOR DATASET {dataset_num}")
+    print("="*50)
+    
+    total_imgs = len(img_names)
+    reg_imgs = len(cameras_pose)
+    sparse_count = final_points.shape[1]
+    
+    print(f"Images Registered: {reg_imgs}/{total_imgs}")
+    print(f"Sparse Points:     {sparse_count}")
+    
+    if dense_cloud is not None:
+        dense_count = dense_cloud.shape[1]
+        print(f"Dense Points:      {dense_count}")
+    else:
+        print("Dense Points:      N/A (Not used or failed)")
+        
+    print("="*50 + "\n")
         
     return metrics
 
@@ -1221,5 +1473,5 @@ def run_all_datasets(start=1, end=9, *, visualize=False, use_roma_dense=True, sa
             print(f"Dataset {d} error: {e}")
 
 if __name__ == "__main__":
-    run_all_datasets(1, 9, visualize=False, use_roma_dense=True, save_plot_dir="./sfm_plots_new")
-    # run_sfm(7, visualize=True, use_roma_dense=True, save_plot_dir="./output", seed=40)
+    run_all_datasets(1, 8, visualize=False, use_roma_dense=True, save_plot_dir="./final_output")
+    # run_sfm(7, visualize=False, use_roma_dense=True, save_plot_dir="./output")
